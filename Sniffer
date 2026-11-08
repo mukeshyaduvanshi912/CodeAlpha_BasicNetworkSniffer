@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+CodeAlpha Cyber Security Internship - Task 1: Basic Network Sniffer
+Captures packets with scapy and prints source/destination IPs, protocol,
+ports, flags and a payload preview. Optionally saves to a .pcap file and
+prints a protocol summary at the end.
+
+Run with administrator/root privileges. Use only on networks you own or
+have permission to monitor.
+"""
+
+import argparse
+import sys
+from collections import Counter
+from datetime import datetime
+
+try:
+    from scapy.all import (
+        sniff, wrpcap, conf,
+        Ether, IP, IPv6, TCP, UDP, ICMP, ARP, DNS, Raw,
+    )
+except ImportError:
+    sys.exit("scapy is not installed. Run: pip install -r requirements.txt")
+
+stats = Counter()
+captured = []
+args = None
+
+TCP_FLAGS = {"F": "FIN", "S": "SYN", "R": "RST", "P": "PSH",
+             "A": "ACK", "U": "URG", "E": "ECE", "C": "CWR"}
+
+
+def flags_to_str(flags):
+    return "+".join(TCP_FLAGS[f] for f in str(flags) if f in TCP_FLAGS) or "-"
+
+
+def payload_preview(packet, limit=64):
+    """Return a printable preview of the packet payload."""
+    if not packet.haslayer(Raw):
+        return None
+    data = bytes(packet[Raw].load)[:limit]
+    text = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+    return f"{text}  (hex: {data.hex()[:40]}...)" if args.hex else text
+
+
+def handle_packet(packet):
+    stats["total"] += 1
+    captured.append(packet)
+    ts = datetime.now().strftime("%H:%M:%S")
+
+    # --- ARP (no IP layer) ---
+    if packet.haslayer(ARP):
+        stats["ARP"] += 1
+        a = packet[ARP]
+        op = "request" if a.op == 1 else "reply"
+        print(f"[{ts}] ARP {op}: {a.psrc} ({a.hwsrc}) -> {a.pdst}")
+        return
+
+    # --- IP layer ---
+    if packet.haslayer(IP):
+        ip = packet[IP]
+        src, dst, ttl = ip.src, ip.dst, ip.ttl
+    elif packet.haslayer(IPv6):
+        ip = packet[IPv6]
+        src, dst, ttl = ip.src, ip.dst, ip.hlim
+    else:
+        stats["Other"] += 1
+        return
+
+    # --- Transport / protocol ---
+    if packet.haslayer(TCP):
+        t = packet[TCP]
+        proto = "TCP"
+        detail = f"{src}:{t.sport} -> {dst}:{t.dport} flags={flags_to_str(t.flags)}"
+    elif packet.haslayer(UDP):
+        u = packet[UDP]
+        proto = "DNS" if packet.haslayer(DNS) else "UDP"
+        detail = f"{src}:{u.sport} -> {dst}:{u.dport}"
+        if packet.haslayer(DNS) and packet[DNS].qd is not None:
+            qname = packet[DNS].qd.qname.decode(errors="ignore")
+            detail += f" query={qname}"
+    elif packet.haslayer(ICMP):
+        proto = "ICMP"
+        detail = f"{src} -> {dst} type={packet[ICMP].type}"
+    else:
+        proto = f"IP-proto-{getattr(ip, 'proto', getattr(ip, 'nh', '?'))}"
+        detail = f"{src} -> {dst}"
+
+    stats[proto] += 1
+    print(f"[{ts}] {proto:<5} {detail} ttl={ttl} len={len(packet)}")
+
+    if args.payload:
+        preview = payload_preview(packet)
+        if preview:
+            print(f"        payload: {preview}")
+
+
+def print_summary():
+    print("\n" + "=" * 50)
+    print("Capture summary")
+    print("=" * 50)
+    print(f"Total packets: {stats['total']}")
+    for proto, count in stats.most_common():
+        if proto != "total":
+            print(f"  {proto:<10} {count}")
+
+
+def is_npcap_missing_error(exc):
+    message = str(exc).lower()
+    return (
+        "winpcap" in message
+        or "npcap" in message
+        or ("sniffing" in message and "layer 2" in message)
+    )
+
+
+def main():
+    global args
+    p = argparse.ArgumentParser(description="Basic network sniffer (CodeAlpha Task 1)")
+    p.add_argument("-i", "--iface", help="interface to sniff on (default: auto)")
+    p.add_argument("-c", "--count", type=int, default=0,
+                   help="number of packets to capture (0 = until Ctrl+C)")
+    p.add_argument("-f", "--filter", default="",
+                   help='BPF filter, e.g. "tcp port 80" or "udp port 53"')
+    p.add_argument("-p", "--payload", action="store_true",
+                   help="show a preview of packet payloads")
+    p.add_argument("--hex", action="store_true", help="also show payload hex")
+    p.add_argument("-w", "--write", help="save capture to a .pcap file")
+    p.add_argument("--list-ifaces", action="store_true", help="list interfaces and exit")
+    args = p.parse_args()
+
+    if args.list_ifaces:
+        print(conf.ifaces)
+        return
+
+    print(f"Sniffing on {args.iface or 'default interface'} "
+          f"| filter: '{args.filter or 'none'}' | Ctrl+C to stop\n")
+    try:
+        sniff(iface=args.iface, filter=args.filter or None,
+              prn=handle_packet, count=args.count, store=False)
+    except PermissionError:
+        sys.exit("Permission denied. Run as root/administrator (sudo python3 sniffer.py).")
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError as e:
+        if is_npcap_missing_error(e):
+            sys.exit(
+                "Packet capture requires Npcap/WinPcap on Windows. "
+                "Install Npcap (https://npcap.com) and run this script as Administrator."
+            )
+        sys.exit(f"Capture error: {e}")
+    except OSError as e:
+        sys.exit(f"Capture error: {e}\nOn Windows, install Npcap (https://npcap.com).")
+
+    print_summary()
+    if args.write and captured:
+        wrpcap(args.write, captured)
+        print(f"\nSaved {len(captured)} packets to {args.write}")
+
+
+if __name__ == "__main__":
+    main()
